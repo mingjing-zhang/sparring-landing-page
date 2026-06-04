@@ -3,7 +3,7 @@
 // SKILL.md files live in landing-page/skills/ (copied from sparring/skills/).
 
 import { anthropic } from "@ai-sdk/anthropic";
-import { streamText } from "ai";
+import { streamText, generateText } from "ai";
 import { readFileSync } from "fs";
 import { join } from "path";
 
@@ -334,6 +334,150 @@ If you find yourself writing a paragraph in the founder's voice, **stop and rewr
 If the founder pitched in 中文, deliver the debrief in 中文. Preserve archetype's signature English phrasings as artifacts. If pitched in English, deliver in English.
 `;
 
+// ============================================================
+// v0.1.7 architectural hotfix — programmatic Coach validation
+// ============================================================
+//
+// Background: across 2 production Coach Mode A tests (2026-06-04 GreenLedger
+// + CryptoVault), the soft rules in COACH_RUNTIME_RULES failed on:
+//   - P3.4 length cap (1500w): 2/2 violations (~2000-2200w each)
+//   - P3.5 fund-name fabrication: 1/2 (GreenLedger named Salesforce/Insight/
+//     Work-Bench/Operator not in transcript)
+//   - P3.5 spirit extension (law firms): 1/2 (CryptoVault named Carey Olsen/Ogier)
+//
+// Meta-finding (PRINCIPLES.md M16): rule-text enforcement has a structural
+// ceiling. The LLM treats substantive Coach work as license to override caps.
+// This hotfix adds the only mechanism that actually works: programmatic
+// post-processing + auto-regen with explicit violation feedback.
+//
+// Implementation: Coach uses generateText (non-streaming, single-shot debrief)
+// instead of streamText. After generation, validate against 3 hard rules.
+// If any fail, regenerate ONCE with violations injected into system prompt.
+// Partner archetypes (Thesis Partner / Debater) keep streaming behavior — their
+// rule compliance is good per production testing.
+
+const FORBIDDEN_VC_FUNDS = [
+  // Crypto VCs
+  "a16z", "Andreessen Horowitz", "Sequoia", "Dragonfly", "Spartan",
+  "Hashkey", "HashKey", "Pantera", "Polychain", "Multicoin", "Paradigm",
+  "Coinbase Ventures", "Binance Labs", "Galaxy", "Foresight", "Hashed",
+  "Animoca", "Framework", "Variant", "Standard Crypto", "Electric Capital",
+  "Placeholder", "1confirmation", "Distributed Global",
+  // Enterprise / generalist VCs frequently fabricated by Coach
+  "Salesforce Ventures", "Insight Partners", "Insight Venture",
+  "Operator Collective", "NEA", "Greylock", "Accel", "Benchmark",
+  "Lightspeed", "Index Ventures", "IVP", "Bessemer", "GGV",
+  "Khosla", "Founders Fund", "Tiger Global", "Coatue", "SoftBank",
+  "Work-Bench", "Work Bench",
+];
+
+const FORBIDDEN_LAW_FIRMS = [
+  "Carey Olsen", "Ogier", "Maples", "Walkers", "Conyers",
+  "Skadden", "Davis Polk", "Cravath", "Sullivan Cromwell", "Sullivan & Cromwell",
+  "Latham", "Kirkland", "Wachtell", "Paul Weiss", "Sidley",
+  "Cleary", "Ropes", "Cooley", "Wilson Sonsini", "Fenwick",
+  "Goodwin", "DLA Piper", "Mayer Brown", "Bryan Cave", "Allen Overy",
+  "A&O Shearman",
+];
+
+const FORBIDDEN_AUDIT_FIRMS = [
+  "Trail of Bits", "Quantstamp", "OpenZeppelin", "ConsenSys Diligence",
+  "ChainSecurity", "Certora", "Spearbit", "Sigma Prime", "Halborn",
+];
+
+const FORBIDDEN_CUSTODY_PROVIDERS = [
+  "Anchorage", "Fireblocks", "Coinbase Custody", "BitGo", "Copper",
+  "Hex Trust",
+];
+
+const ALL_FORBIDDEN_NAMES = [
+  ...FORBIDDEN_VC_FUNDS,
+  ...FORBIDDEN_LAW_FIRMS,
+  ...FORBIDDEN_AUDIT_FIRMS,
+  ...FORBIDDEN_CUSTODY_PROVIDERS,
+];
+
+// Approximate word count: English tokens + Chinese chars × 0.6
+// (matches the heuristic in PRINCIPLES.md analysis of session word counts)
+function countWords(text: string): number {
+  const englishWords = text.match(/[a-zA-Z][a-zA-Z'\-]*/g) ?? [];
+  const chineseChars = text.match(/[一-龥]/g) ?? [];
+  return englishWords.length + Math.ceil(chineseChars.length * 0.6);
+}
+
+// True iff name appears as a standalone token in the text. Handles names with
+// spaces, dots, ampersands. Case-insensitive.
+function nameAppearsIn(name: string, text: string): boolean {
+  // Escape regex special chars in the name
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Word-boundary on each side (\b doesn't work mid-CJK but our names are ASCII)
+  const re = new RegExp(`\\b${escaped}\\b`, "i");
+  return re.test(text);
+}
+
+function findForbiddenNames(output: string, transcript: string): string[] {
+  const found: string[] = [];
+  for (const name of ALL_FORBIDDEN_NAMES) {
+    if (nameAppearsIn(name, output) && !nameAppearsIn(name, transcript)) {
+      found.push(name);
+    }
+  }
+  // De-duplicate
+  return Array.from(new Set(found));
+}
+
+function containsEmailAddress(text: string): boolean {
+  // Match anything that looks like an email — even fabricated ones
+  return /[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(text);
+}
+
+interface ValidationResult {
+  pass: boolean;
+  issues: string[];
+  wordCount: number;
+  forbiddenNames: string[];
+  hasEmail: boolean;
+}
+
+function validateCoachOutput(output: string, transcript: string): ValidationResult {
+  const wordCount = countWords(output);
+  const forbiddenNames = findForbiddenNames(output, transcript);
+  const hasEmail = containsEmailAddress(output);
+
+  const issues: string[] = [];
+  if (wordCount > 1500) {
+    issues.push(
+      `Total word count is ~${wordCount}. The HARD CAP is 1500. ` +
+      `Cut the longest sections: usually "3 Questions That Cut Deepest" ` +
+      `(target 300w total), "What To Fix" (250w total, ≤50w per item), ` +
+      `and "Final Read" (150w max — no Option A/B/C menu).`
+    );
+  }
+  if (forbiddenNames.length > 0) {
+    issues.push(
+      `Output names specific external parties NOT mentioned in the session ` +
+      `transcript: ${forbiddenNames.join(", ")}. These are categorically ` +
+      `forbidden (P3.5 + V0.2-7 extension). Replace each with a CATEGORY ` +
+      `name (e.g., "Cayman SPV counsel" not "Carey Olsen"; ` +
+      `"Asia-distribution-focused crypto VC" not "Dragonfly").`
+    );
+  }
+  if (hasEmail) {
+    issues.push(
+      `Output contains an "@" email address. This is forbidden under P3.5. ` +
+      `Remove all email addresses, real or fabricated.`
+    );
+  }
+
+  return {
+    pass: issues.length === 0,
+    issues,
+    wordCount,
+    forbiddenNames,
+    hasEmail,
+  };
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -382,14 +526,110 @@ export async function POST(req: Request) {
     const runtimeRules =
       archetype === "coach" ? COACH_RUNTIME_RULES : PARTNER_RUNTIME_RULES;
     const systemPrompt = skillContent + runtimeRules;
+    const modelName = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+    const aiMessages = messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
 
+    // ============================================================
+    // Coach archetype: non-streaming + programmatic validation + auto-regen
+    // (v0.1.7 hotfix per PRINCIPLES.md M16 — rule text alone insufficient)
+    // ============================================================
+    if (archetype === "coach") {
+      const transcriptText = messages.map((m) => m.content).join("\n\n");
+
+      // First pass: generate the debrief
+      const firstPass = await generateText({
+        model: anthropic(modelName),
+        system: systemPrompt,
+        messages: aiMessages,
+      });
+      let output = firstPass.text;
+      let validation = validateCoachOutput(output, transcriptText);
+
+      // If validation fails, regenerate ONCE with explicit feedback
+      if (!validation.pass) {
+        console.warn(
+          "[Coach v0.1.7] First-pass validation failed:",
+          JSON.stringify({
+            wordCount: validation.wordCount,
+            forbiddenNames: validation.forbiddenNames,
+            hasEmail: validation.hasEmail,
+          })
+        );
+
+        const regenSystemPrompt =
+          systemPrompt +
+          `
+
+---
+
+# CRITICAL — Your previous draft failed validation. Fix BEFORE emitting.
+
+Your previous draft had these specific violations:
+
+${validation.issues.map((issue, i) => `${i + 1}. ${issue}`).join("\n\n")}
+
+Rewrite the FULL debrief. Same structure, same analytical depth, same Mode A or Mode B routing. But this time:
+
+- Count words SECTION-BY-SECTION before writing each section. Stop writing a section when its budget is hit. Total ≤ 1500 words.
+- Use CATEGORY names for any external party not present verbatim in the session transcript. The transcript is the user's most recent message. If a party isn't there, you cannot name it.
+- NO "@" character anywhere in the output. No email addresses, real or fabricated.
+
+If you find yourself writing "Salesforce Ventures", "Carey Olsen", "Trail of Bits", or any specific firm name — STOP and check the transcript. If it's not there, use a category like "Cayman SPV counsel" or "top-tier smart contract auditor" instead.
+
+Begin the rewritten debrief now.
+`;
+
+        const regenPass = await generateText({
+          model: anthropic(modelName),
+          system: regenSystemPrompt,
+          messages: aiMessages,
+        });
+        output = regenPass.text;
+        const regenValidation = validateCoachOutput(output, transcriptText);
+
+        if (!regenValidation.pass) {
+          console.warn(
+            "[Coach v0.1.7] Regen ALSO failed validation:",
+            JSON.stringify({
+              wordCount: regenValidation.wordCount,
+              forbiddenNames: regenValidation.forbiddenNames,
+              hasEmail: regenValidation.hasEmail,
+            })
+          );
+          // Return the regen output anyway — better than nothing. Operators
+          // see the warning in Cloud Run logs; we accept this as graceful
+          // degradation rather than failing the user request.
+        } else {
+          console.log("[Coach v0.1.7] Regen passed validation.");
+        }
+      }
+
+      // Stream the validated text back as a plain text response
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(output));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      });
+    }
+
+    // ============================================================
+    // Partner archetypes (Thesis Partner / Debater): keep streaming
+    // (production v0.1.6 rule compliance is good — no programmatic
+    // validation needed at this layer)
+    // ============================================================
     const result = streamText({
-      model: anthropic(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5"),
+      model: anthropic(modelName),
       system: systemPrompt,
-      messages: messages.map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
+      messages: aiMessages,
     });
 
     return result.toTextStreamResponse();
