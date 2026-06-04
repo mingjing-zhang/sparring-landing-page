@@ -31,6 +31,8 @@ Thumbs.db
 docs/
 *.md
 !README.md
+# Sparring skill files — read at runtime by app/api/chat/route.ts (DO NOT EXCLUDE)
+!skills/*.md
 
 # Test files
 __tests__
